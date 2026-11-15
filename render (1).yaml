@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: nexus-code
+    runtime: node
+    plan: starter            # a persistent disk needs a paid plan
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    disk:
+      name: nexus-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: ACCESS_TOKEN
+        generateValue: true  # your login for the app; shown in the Render dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false          # paste in the dashboard (optional if you use your own key in the app)
+      - key: MODEL
+        value: claude-sonnet-5-5
