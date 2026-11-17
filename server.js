@@ -84,12 +84,33 @@ async function stream(body,keys,signal,emit){let last='';
     else if(j.type==='error')throw Error((j.error&&j.error.message)||'stream error')}}
   return{blocks:B.filter(Boolean),stop,usage}}
  throw Error('Every API key failed. Last: '+last)}
+
+/* OpenAI-compatible providers (OpenAI, OpenRouter, Groq, DeepSeek, local gateways...) */
+function toOA(M,sys){const o=[{role:'system',content:sys}];for(const m of M){if(typeof m.content==='string'){o.push({role:m.role,content:m.content});continue}
+ if(m.role==='assistant'){const t=m.content.filter(x=>x.type==='text').map(x=>x.text).join(''),c=m.content.filter(x=>x.type==='tool_use');o.push({role:'assistant',content:t||null,...(c.length?{tool_calls:c.map(x=>({id:x.id,type:'function',function:{name:x.name,arguments:JSON.stringify(x.input||{})}}))}:{})})}
+ else for(const b of m.content)o.push(b.type==='tool_result'?{role:'tool',tool_call_id:b.tool_use_id,content:String(b.content)}:{role:'user',content:b.text||''})}return o}
+async function streamOA(a,keys,signal,emit){let last='';
+ for(const[src,key]of keys){
+  const r=await fetch(a.endpoint,{method:'POST',signal,headers:{'content-type':'application/json',authorization:'Bearer '+key},body:JSON.stringify({model:a.model,stream:true,stream_options:{include_usage:true},messages:toOA(a.M,a.sys),tools:a.TL.map(t=>({type:'function',function:{name:t.name,description:t.description,parameters:t.input_schema}}))})});
+  if(!r.ok){const tx=await r.text();last=`${src} key: HTTP ${r.status} ${tx.slice(0,200)}`;if([401,403,429,500,502,503].includes(r.status)){emit({t:'keyfail',src,m:last});continue}throw Error(last)}
+  emit({t:'key',src});
+  const rd=r.body.getReader(),dec=new TextDecoder(),T=[];let buf='',txt='',usage={};
+  for(;;){const{done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+   while((i=buf.indexOf('\n'))>=0){const l=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!l.startsWith('data:')||l.includes('[DONE]'))continue;let j;try{j=JSON.parse(l.slice(5))}catch{continue}
+    if(j.usage)usage={input_tokens:j.usage.prompt_tokens};const d=j.choices&&j.choices[0]&&j.choices[0].delta;if(!d)continue;
+    const rs=d.reasoning_content||d.reasoning;if(rs)emit({t:'think',d:rs});
+    if(d.content){txt+=d.content;emit({t:'text',d:d.content})}
+    for(const c of d.tool_calls||[]){const x=c.index||0,k=T[x]||(T[x]={id:'',name:'',a:''});if(c.id)k.id=c.id;if(c.function){if(c.function.name&&!k.name){k.name=c.function.name;emit({t:'compose',name:k.name})}k.a+=c.function.arguments||''}}}}
+  const blocks=[];if(txt.trim())blocks.push({type:'text',text:txt});
+  for(const k of T.filter(Boolean)){let inp={};try{inp=JSON.parse(k.a||'{}')}catch{}blocks.push({type:'tool_use',id:k.id||'call_'+Math.random().toString(36).slice(2,10),name:k.name,input:inp})}
+  return{blocks,usage}}
+ throw Error('Every API key failed. Last: '+last)}
 const busy=new Set();
 async function chat(req,res){
  const b=await rb(req),id=b.session;
  if(!/^[\w-]{1,40}$/.test(id||'')||!String(b.text||'').trim())return send(res,400,{error:'session and text are required'});
  if(busy.has(id))return send(res,409,{error:'This chat is already running.'});
- const keys=[['local',req.headers['x-user-key']],['render',E.ANTHROPIC_API_KEY],['render-2',E.ANTHROPIC_API_KEY_2]].filter(k=>k[1]);
+ const oa=b.prov==='openai',keys=(oa?[['local',req.headers['x-user-key']],['render',E.OPENAI_API_KEY||E.LLM_API_KEY],['render-2',E.LLM_API_KEY_2]]:[['local',req.headers['x-user-key']],['render',E.ANTHROPIC_API_KEY],['render-2',E.ANTHROPIC_API_KEY_2]]).filter(k=>k[1]);
  res.writeHead(200,{'content-type':'application/x-ndjson','cache-control':'no-cache','x-accel-buffering':'no'});
  const emit=o=>res.writable&&res.write(JSON.stringify(o)+'\n'),ac=new AbortController(),hb=setInterval(()=>emit({t:'hb'}),15000);
  res.on('close',()=>ac.abort());busy.add(id);
@@ -101,7 +122,7 @@ async function chat(req,res){
   for(let n=0;n<MAXT&&!ac.signal.aborted;n++){
    prune(s.messages,emit);
    const mk=th=>({model:b.model||MODEL,max_tokens:32000,stream:true,system:[{type:'text',text:sys,cache_control:{type:'ephemeral'}}],tools:TL,messages:cached(s.messages),...(th?{thinking:th}:{})});
-   let r;for(;;){try{r=await stream(mk(TMS[tmi]),keys,ac.signal,emit);break}catch(e){if(e.status===400&&/think/i.test(e.body||'')&&tmi<TMS.length-1){tmi++;continue}throw e}}
+   let r;for(;;){try{r=oa?await streamOA({endpoint:b.endpoint||E.LLM_ENDPOINT||'https://api.openai.com/v1/chat/completions',model:b.model||E.LLM_MODEL||'gpt-4o-mini',sys,TL,M:s.messages},keys,ac.signal,emit):await stream(mk(TMS[tmi]),keys,ac.signal,emit);break}catch(e){if(e.status===400&&/think/i.test(e.body||'')&&tmi<TMS.length-1){tmi++;continue}throw e}}
    s.messages.push({role:'assistant',content:r.blocks.filter(x=>x.type!=='text'||x.text.trim())});
    const u=r.usage;emit({t:'usage',used:(u.input_tokens||0)+(u.cache_read_input_tokens||0)+(u.cache_creation_input_tokens||0),ctx:CTX});
    const uses=r.blocks.filter(x=>x.type==='tool_use');if(!uses.length)break;
@@ -117,13 +138,16 @@ const rb=req=>new Promise(r=>{let b='';req.on('data',d=>b+=d);req.on('end',()=>{
 const authed=req=>{const a=Buffer.from((req.headers.authorization||'').slice(7)),b=Buffer.from(TOKEN);return!!TOKEN&&a.length===b.length&&crypto.timingSafeEqual(a,b)};
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://x'),p=u.pathname;
  if(p==='/healthz')return res.end('ok');
- if(!p.startsWith('/api/')){res.writeHead(200,{'content-type':'text/html;charset=utf-8'});return res.end(await fsp.readFile(path.join(__dirname,'public','index.html')))}
+ if(!p.startsWith('/api/')){res.writeHead(200,{'content-type':'text/html;charset=utf-8'});return res.end(await fsp.readFile(path.join(__dirname,'index.html')).catch(()=>fsp.readFile(path.join(__dirname,'public','index.html'))))}
  if(!TOKEN)return send(res,503,{error:'Set the ACCESS_TOKEN environment variable on the server.'});
  if(!authed(req))return send(res,401,{error:'Wrong access token.'});
- if(p==='/api/config')return send(res,200,{model:MODEL,render:!!E.ANTHROPIC_API_KEY,ctx:CTX,thinking:THINK});
+ if(p==='/api/config')return send(res,200,{model:MODEL,render:!!E.ANTHROPIC_API_KEY,renderOA:!!(E.OPENAI_API_KEY||E.LLM_API_KEY),ctx:CTX,thinking:THINK});
  if(p==='/api/files')return send(res,200,{files:(await walk(WS)).sort().slice(0,1000)});
  if(p==='/api/file')return send(res,200,{text:(await fsp.readFile(P(u.searchParams.get('p')),'utf8')).slice(0,300000)});
  if(p==='/api/sessions'){const o=[];for(const f of await fsp.readdir(SD)){try{const s=JSON.parse(await fsp.readFile(path.join(SD,f),'utf8'));o.push({id:s.id,title:s.title||'New chat',ts:s.ts})}catch{}}return send(res,200,{sessions:o.sort((a,b)=>b.ts-a.ts)})}
  if(p==='/api/session'){const id=u.searchParams.get('id')||'';if(!/^[\w-]{1,40}$/.test(id))return send(res,400,{error:'bad id'});return send(res,200,await loadS(id))}
+ if(p==='/api/models'){const pv=u.searchParams.get('prov'),ep=u.searchParams.get('endpoint')||'',oa=pv==='openai',k=req.headers['x-user-key']||(oa?E.OPENAI_API_KEY||E.LLM_API_KEY:E.ANTHROPIC_API_KEY);if(!k)return send(res,400,{error:'Add an API key first (or set one on Render).'});
+  const base=oa?(ep||E.LLM_ENDPOINT||'https://api.openai.com/v1/chat/completions').replace(/\/chat\/completions\/?$/,''):'https://api.anthropic.com/v1',r=await fetch(base+'/models'+(oa?'':'?limit=100'),{headers:oa?{authorization:'Bearer '+k}:{'x-api-key':k,'anthropic-version':'2023-06-01'}}),j=await r.json().catch(()=>({}));
+  return send(res,200,j.data?{models:j.data.map(m=>m.id).sort()}:{error:(j.error&&(j.error.message||JSON.stringify(j.error)))||'HTTP '+r.status})}
  if(p==='/api/chat'&&req.method==='POST')return chat(req,res);
  send(res,404,{error:'Not found'})}catch(e){if(!res.headersSent)send(res,500,{error:e.message});else res.end()}}).listen(PORT,()=>console.log('NEXUS listening on :'+PORT+(TOKEN?'':' (ACCESS_TOKEN is not set: API is locked)')));
