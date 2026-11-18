@@ -23422,7 +23422,7 @@ function buildCompactSummaryText(messagesToCompact) {
               }
             }
           }
-        } else if (b.type === "thinking" && b.thinking.trim()) {
+        } else if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
           const line = b.thinking.trim().split("\n")[0].slice(0, 140);
           if (line && reasoningHighlights.length < 4) reasoningHighlights.push(line);
         }
@@ -23780,7 +23780,10 @@ async function loadSession(id) {
 }
 async function saveSession(s) {
   s.ts = Date.now();
-  await import_promises.default.writeFile(sessionPath(s.id), JSON.stringify(s, null, 2));
+  const sp = sessionPath(s.id);
+  const tmp = sp + "." + process.pid + ".tmp";
+  await import_promises.default.writeFile(tmp, JSON.stringify(s, null, 2));
+  await import_promises.default.rename(tmp, sp);
 }
 async function listSessions() {
   const files = await import_promises.default.readdir(SD);
@@ -23880,7 +23883,7 @@ function runShell(cmd, timeoutMs, onData, signal, cwdOverride) {
     child.stdout.on("data", onChunk);
     child.stderr.on("data", onChunk);
     child.on("error", (err) => finish({ code: -1, out: String(err) }));
-    child.on("close", (code) => finish({ code: timedOut ? -1 : code ?? 0, out }));
+    child.on("close", (code) => finish({ code: timedOut ? -1 : code ?? -1, out }));
   });
 }
 var bgProcesses = /* @__PURE__ */ new Map();
@@ -23988,20 +23991,18 @@ function submitUserResponse(qid, answer) {
   return true;
 }
 function sanitizeMessagesForRepair(messages) {
-  const last = messages[messages.length - 1];
-  if (last && last.role === "assistant" && Array.isArray(last.content)) {
-    const pendingUses = last.content.filter((b) => b.type === "tool_use");
-    if (pendingUses.length > 0) {
-      messages.push({
-        role: "user",
-        content: pendingUses.map((u) => ({
-          type: "tool_result",
-          tool_use_id: u.id,
-          content: "[interrupted before this tool finished]",
-          is_error: true
-        }))
-      });
-    }
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    const ids = m.content.filter((b) => b.type === "tool_use").map((b) => b.id);
+    if (!ids.length) continue;
+    const next = messages[i + 1];
+    const nextOk = next && next.role === "user" && Array.isArray(next.content);
+    const have = nextOk ? next.content.filter((b) => b.type === "tool_result").map((b) => b.tool_use_id) : [];
+    const missing = ids.filter((id) => !have.includes(id)).map((id) => ({ type: "tool_result", tool_use_id: id, content: "[interrupted before this tool finished]", is_error: true }));
+    if (!missing.length) continue;
+    if (nextOk) next.content.push(...missing);
+    else messages.splice(i + 1, 0, { role: "user", content: missing });
   }
 }
 
@@ -24122,7 +24123,7 @@ ${createSimpleDiff(String(a.path), prev, next, 90)}`;
     ),
     needsApproval: true,
     f: async (a) => {
-      const edits = a.edits || [];
+      const edits = (a.edits || []).map((e) => e && typeof e.path === "string" && e.path.trim() ? { ...e, path: import_node_path3.default.relative(WS, P(e.path)) || e.path } : e);
       const cache = /* @__PURE__ */ new Map();
       for (const e of edits) {
         if (e && e.path && !cache.has(e.path)) {
@@ -24241,9 +24242,9 @@ ${diffs.join("\n")}` : "");
       const baseDir = a.path ? P(a.path) : WS;
       const re = globToRegex(String(a.pattern || "**/*"));
       const all = (await walkWorkspace(baseDir)).map(
-        (p) => a.path ? import_node_path3.default.relative(WS, import_node_path3.default.join(baseDir, p)) : p
+        (p) => p
       );
-      const matched = all.filter((p) => re.test(p)).sort();
+      const matched = all.filter((p) => re.test(import_node_path3.default.relative(baseDir, import_node_path3.default.join(WS, p)))).sort();
       return matched.length ? matched.slice(0, 500).join("\n") + (matched.length > 500 ? `
 [${matched.length - 500} more]` : "") : "(no matches)";
     }
@@ -24408,7 +24409,7 @@ ${lines || "(no output yet)"}`;
       const files = Array.isArray(a.files) && a.files.length > 0 ? a.files.map((f) => q(import_node_path3.default.relative(WS, P(f)))).join(" ") : "-A";
       const addRes = await runShell(`git add ${files}`, 15e3, void 0, ctx.signal);
       if (addRes.code !== 0) throw new Error(addRes.out);
-      const comRes = await runShell(`git commit -m ${q(msg)}`, 2e4, void 0, ctx.signal);
+      const comRes = await runShell(`git -c user.name="$(git config user.name || echo NEXUS)" -c user.email="$(git config user.email || echo nexus@localhost)" commit -m ${q(msg)}`, 2e4, void 0, ctx.signal);
       if (comRes.code !== 0) throw new Error(comRes.out);
       return comRes.out.trim() || "Committed.";
     }
@@ -24698,6 +24699,7 @@ function claudeThinkingConfig(effort) {
   return { type: "adaptive" };
 }
 function withAnthropicCache(messages) {
+  messages = messages.map((m) => Array.isArray(m.content) ? { role: m.role, content: m.content.filter((b) => b && !(b.type === "thinking" && !b.signature)) } : m).filter((m) => typeof m.content === "string" || m.content.length > 0);
   if (!messages.length) return [];
   return messages.map((m, idx) => {
     if (idx !== messages.length - 1) return { role: m.role, content: m.content };
@@ -24708,6 +24710,7 @@ function withAnthropicCache(messages) {
     return { role: m.role, content: arr };
   });
 }
+var thinkMemo = /* @__PURE__ */ new Map();
 async function streamClaude(params, keys, signal, emit) {
   const toolList = Object.entries(TOOLS).map(([name, t], i, arr) => ({
     name,
@@ -24719,15 +24722,13 @@ async function streamClaude(params, keys, signal, emit) {
   const primaryThink = claudeThinkingConfig(params.effort);
   if (primaryThink) {
     thinkingCandidates.push(primaryThink);
-    if (primaryThink.type === "adaptive") {
-      thinkingCandidates.push({ type: "enabled", budget_tokens: 16e3 });
-    }
+    thinkingCandidates.push(primaryThink.type === "adaptive" ? { type: "enabled", budget_tokens: 16e3 } : { type: "adaptive" });
   }
   thinkingCandidates.push(null);
   const targetUrl = normalizeEndpointUrl("claude", params.endpoint || E2.ANTHROPIC_BASE_URL);
   let lastErr = "";
   for (const { src, key } of keys) {
-    for (let ti = 0; ti < thinkingCandidates.length; ti++) {
+    for (let ti = Math.min(thinkMemo.get(params.model + "|" + params.effort) || 0, thinkingCandidates.length - 1); ti < thinkingCandidates.length; ti++) {
       const th = thinkingCandidates[ti];
       const body = {
         model: params.model,
@@ -24763,6 +24764,7 @@ async function streamClaude(params, keys, signal, emit) {
         throw new Error(lastErr);
       }
       emit({ t: "key", src });
+      thinkMemo.set(params.model + "|" + params.effort, ti);
       if (!res.body) throw new Error("Empty response stream");
       const rd = res.body.getReader();
       const dec = new TextDecoder();
@@ -24839,7 +24841,7 @@ async function streamClaude(params, keys, signal, emit) {
   }
   throw new Error("Every API key failed. Last: " + lastErr);
 }
-function toOpenAIMessages(messages, sys) {
+function toOpenAIMessages(messages, sys, withReasoning = true) {
   const out = [{ role: "system", content: sys }];
   for (const m of messages) {
     if (typeof m.content === "string") {
@@ -24857,7 +24859,7 @@ function toOpenAIMessages(messages, sys) {
         role: "assistant",
         content: text || null
       };
-      if (thinkingText) {
+      if (thinkingText && withReasoning) {
         assistantMsg.reasoning_content = thinkingText;
       }
       if (toolCalls.length > 0) {
@@ -24898,11 +24900,12 @@ async function streamOpenAI(params, keys, signal, emit) {
   for (const { src, key } of keys) {
     let useReasoningParam = Boolean(oaEffort);
     let useStreamOptions = true;
+    let useReasoningHistory = true;
     for (let attempt = 0; attempt < 3; attempt++) {
       const payload = {
         model: params.model,
         stream: true,
-        messages: toOpenAIMessages(params.messages, params.sys),
+        messages: toOpenAIMessages(params.messages, params.sys, useReasoningHistory),
         tools: oaTools
       };
       if (useStreamOptions) payload.stream_options = { include_usage: true };
@@ -24928,6 +24931,10 @@ async function streamOpenAI(params, keys, signal, emit) {
         }
         if (res.status === 400 && /stream_options/i.test(tx) && useStreamOptions) {
           useStreamOptions = false;
+          retry = true;
+        }
+        if (res.status === 400 && /reasoning_content/i.test(tx) && useReasoningHistory) {
+          useReasoningHistory = false;
           retry = true;
         }
         if (retry) continue;
@@ -25194,7 +25201,10 @@ async function compactMessages(messages, keepRecentCount = 6) {
   if (messages.length <= keepRecentCount) {
     return { nextMessages: messages, removedCount: 0, summaryText: "" };
   }
-  const splitIdx = messages.length - keepRecentCount;
+  let splitIdx = messages.length - keepRecentCount;
+  const isToolResultMsg = (m) => m && m.role === "user" && Array.isArray(m.content) && m.content.some((b) => b.type === "tool_result");
+  while (splitIdx > 0 && isToolResultMsg(messages[splitIdx])) splitIdx--;
+  if (splitIdx <= 0) return { nextMessages: messages, removedCount: 0, summaryText: "" };
   const older = messages.slice(0, splitIdx);
   const recent = messages.slice(splitIdx);
   const summaryText = buildCompactSummaryText(older);
@@ -25736,6 +25746,7 @@ app.post("/api/chat", async (req, res) => {
   let s;
   try {
     s = await loadSession(id);
+    sanitizeMessagesForRepair(s.messages);
     s.mode = mode;
     s.reasoning = effort;
     if (text.startsWith("!") && text.length > 1) {
@@ -25866,7 +25877,10 @@ ${content.slice(0, 8e3)}`);
       const results = allReadOnly ? await Promise.all(toolUses.map((u) => runToolCall(u, emit, ac.signal, s, mode))) : [];
       if (!allReadOnly) {
         for (const u of toolUses) {
-          if (ac.signal.aborted) break;
+          if (ac.signal.aborted) {
+            results.push({ type: "tool_result", tool_use_id: u.id, content: "[skipped: stopped by user]", is_error: true });
+            continue;
+          }
           results.push(await runToolCall(u, emit, ac.signal, s, mode));
         }
       }
@@ -25890,6 +25904,9 @@ ${content.slice(0, 8e3)}`);
     emit({ t: "done" });
     res.end();
   }
+});
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "Not found" });
 });
 async function startServer() {
   const isDevVite = E3.DEV_VITE === "1";
